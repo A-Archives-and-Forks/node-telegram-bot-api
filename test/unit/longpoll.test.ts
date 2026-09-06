@@ -133,4 +133,148 @@ describe("longPoll", () => {
     }
     assert.ok(caught instanceof NetworkError);
   });
+
+  test("resumes after a 409 conflict without advancing offset, then yields", async () => {
+    const controller = new AbortController();
+    const { api, offsets } = fakeApi([
+      () => {
+        throw new TelegramApiError(409, "Conflict: terminated by other getUpdates request");
+      },
+      () => [upd(100)],
+      () => {
+        controller.abort();
+        return [];
+      },
+    ]);
+
+    const seen: number[] = [];
+    for await (const update of longPoll(api, { conflictRetryDelayMs: 1 }, controller.signal)) {
+      seen.push(update.update_id);
+    }
+    assert.deepStrictEqual(seen, [100]);
+    // Poll 1 (409) and poll 2 both use the same (undefined) offset - no advance on conflict.
+    assert.deepStrictEqual(offsets.slice(0, 2), [undefined, undefined]);
+  });
+
+  test("throws after maxConflictRetries consecutive 409s", async () => {
+    const onError: unknown[] = [];
+    const { api } = fakeApi([
+      () => {
+        throw new TelegramApiError(409, "Conflict");
+      },
+    ]);
+
+    let caught: unknown;
+    try {
+      for await (const _ of longPoll(api, {
+        conflictRetryDelayMs: 1,
+        maxConflictRetries: 3,
+        onError: (e) => onError.push(e),
+      })) {
+        // no-op
+      }
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught instanceof TelegramApiError);
+    assert.strictEqual((caught as TelegramApiError).errorCode, 409);
+    // 3 conflicts were observed and waited on; the 4th throws without an onError call.
+    assert.strictEqual(onError.length, 3);
+  });
+
+  test("a 409 conflict is fatal when retry is disabled", async () => {
+    const { api } = fakeApi([
+      () => {
+        throw new TelegramApiError(409, "Conflict");
+      },
+    ]);
+
+    let caught: unknown;
+    try {
+      for await (const _ of longPoll(api, { retry: false })) {
+        // no-op
+      }
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught instanceof TelegramApiError);
+    assert.strictEqual((caught as TelegramApiError).errorCode, 409);
+  });
+
+  test("a successful (empty) poll resets the consecutive-conflict counter", async () => {
+    const controller = new AbortController();
+    // With maxConflictRetries:2, three conflicts *in a row* would throw. Here an
+    // empty successful poll sits between two bursts, so the streak resets and the
+    // loop keeps going instead of throwing on the fourth conflict overall.
+    const { api } = fakeApi([
+      () => {
+        throw new TelegramApiError(409, "Conflict"); // burst 1: conflict 1
+      },
+      () => {
+        throw new TelegramApiError(409, "Conflict"); // burst 1: conflict 2
+      },
+      () => [], // success -> resets the counter
+      () => {
+        throw new TelegramApiError(409, "Conflict"); // burst 2: conflict 1 (would be #3 without the reset)
+      },
+      () => {
+        controller.abort(); // stop cleanly on the next poll
+        return [upd(200)];
+      },
+    ]);
+
+    const seen: number[] = [];
+    let caught: unknown;
+    try {
+      for await (const update of longPoll(
+        api,
+        { conflictRetryDelayMs: 1, maxConflictRetries: 2 },
+        controller.signal,
+      )) {
+        seen.push(update.update_id);
+      }
+    } catch (err) {
+      caught = err;
+    }
+    // Never threw (the reset kept burst 2 under the bound) and reached the yield.
+    assert.strictEqual(caught, undefined);
+    assert.deepStrictEqual(seen, [200]);
+  });
+
+  test("a non-conflict transient error between 409s breaks the consecutive-conflict streak", async () => {
+    const controller = new AbortController();
+    // maxConflictRetries:1 -> two conflicts in a row would throw. A 5xx transient
+    // sits between them, so the streak resets and the second 409 stays in bounds.
+    const { api } = fakeApi([
+      () => {
+        throw new TelegramApiError(409, "Conflict"); // conflict 1
+      },
+      () => {
+        throw new TelegramApiError(500, "Internal Server Error"); // transient -> resets streak
+      },
+      () => {
+        throw new TelegramApiError(409, "Conflict"); // conflict 1 again (would be #2 without the reset)
+      },
+      () => {
+        controller.abort();
+        return [upd(300)];
+      },
+    ]);
+
+    const seen: number[] = [];
+    let caught: unknown;
+    try {
+      for await (const update of longPoll(
+        api,
+        { conflictRetryDelayMs: 1, retryDelayMs: 1, maxConflictRetries: 1 },
+        controller.signal,
+      )) {
+        seen.push(update.update_id);
+      }
+    } catch (err) {
+      caught = err;
+    }
+    assert.strictEqual(caught, undefined);
+    assert.deepStrictEqual(seen, [300]);
+  });
 });

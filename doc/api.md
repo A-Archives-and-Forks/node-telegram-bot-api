@@ -873,6 +873,21 @@ basename; pass `meta.filename` / `meta.contentType` to override.
 
 **Returns:** Promise<[InputFile](#inputfile)>
 
+### `gracefulClose()`
+
+Begin a non-hanging shutdown of `server`: stop accepting, drop idle keep-alive
+sockets at once (else `close` waits for them forever), and force-close anything
+still busy past `timeoutMs`. Returns the force-close timer so the caller can
+cancel it once `close` completes on its own. The connection helpers need Node
+18.2+ and are optional-chained so a non-Node runtime is a safe no-op.
+
+| Param | Type |
+| --- | --- |
+| `server` | Server |
+| `timeoutMs` | number |
+
+**Returns:** Timeout
+
 ### `isAbortError()`
 
 True for an `AbortController`/timeout abort, across runtimes. Matches both the
@@ -902,6 +917,18 @@ Cloudflare Workers), so the transport classifies our own client timeout as a
 | `value` | unknown |
 
 **Returns:** value is [InputFile](#inputfile)
+
+### `isPollConflict()`
+
+A 409 from `getUpdates` - another instance is polling the same token.
+Recoverable for polling (the competing poller usually exits), not for a plain
+request, so it is classified separately from `isTransientError`.
+
+| Param | Type |
+| --- | --- |
+| `err` | unknown |
+
+**Returns:** boolean
 
 ### `isTransientError()`
 
@@ -1079,6 +1106,11 @@ setup runs first (via `bot.startPolling` -> `bot.init()`), so a bad session
 store fails before the first poll; teardown (`bot.close()`) runs on the way
 out, whether the loop stopped or threw.
 
+A fatal poll-stop is also written to stderr before being re-thrown: a bare
+rejection can be dropped (fire-and-forget, or a swallowing `.catch`), which
+would leave the process alive but no longer polling - the silent hang #1350
+describes.
+
 | Param | Type |
 | --- | --- |
 | `bot` | [Bot](#bot) |
@@ -1107,6 +1139,10 @@ Managed webhook runner: create a `node:http` webhook server, start listening,
 and resolve when it shuts down. Installs `SIGINT`/`SIGTERM` handlers that close
 the server for a graceful exit (cleaned up in a `finally`), mirroring `run()` for
 long polling. Rejects if the server fails (e.g. the port is in use).
+
+Shutdown cannot hang: `server.close()` waits for existing connections to end,
+so we also drop idle keep-alive sockets at once and force-close anything still
+busy past `shutdownTimeoutMs`.
 
 You still register the webhook with Telegram yourself, pointing at this server's
 public URL (terminate TLS at a proxy/tunnel in front of it):
@@ -1212,7 +1248,9 @@ field name and attaches each part - it still stringifies nothing (ADR-011).
 | Property | Type |
 | --- | --- |
 | `allowedUpdates`? | string[] |
+| `conflictRetryDelayMs`? | number |
 | `limit`? | number |
+| `maxConflictRetries`? | number |
 | `offset`? | number |
 | `onError`? | (err: unknown) => void |
 | `retry`? | boolean |
@@ -1289,6 +1327,7 @@ Options for a table block; `caption` is rich text.
 | `path`? | string |
 | `port` | number |
 | `secretToken`? | string |
+| `shutdownTimeoutMs`? | number |
 | `waitUntil`? | (promise: Promise<unknown>) => void |
 
 ### `TransportOptions`
@@ -9669,6 +9708,14 @@ const EntityType: {
   readonly Underline: "underline";
   readonly Url: "url";
 };
+```
+
+### `HTTP_STATUS_CONFLICT`
+
+HTTP 409 "Conflict" - `getUpdates` reports another instance is polling the same token.
+
+```ts
+const HTTP_STATUS_CONFLICT: 409;
 ```
 
 ### `HTTP_STATUS_TOO_MANY_REQUESTS`
